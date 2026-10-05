@@ -154,6 +154,23 @@ def answer(client, token, reply):
     )
 
 
+def confirm_receipt(client, token):
+    return client.post(f"/api/p/{token}/receipt")
+
+
+def receipt_count_for(client_token):
+    """直接查库：某参与者个人链接对应的回执行数（应为 0 或 1）。"""
+    conn = sqlite3.connect(app_module.DB_PATH)
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM receipts rc"
+            " JOIN participants p ON rc.participant_id=p.id WHERE p.token=?",
+            (client_token,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
 def publish_with_reviews(client, host_token, tokens, reviews=("甲评乙", "乙评丙", "丙评甲")):
     """三人首轮意见全部提交并一次公布，返回各 token。"""
     for tok, content in zip(tokens, reviews):
@@ -233,6 +250,8 @@ class SnapshotReadTest(unittest.TestCase):
         self.assertEqual(data["assignment"]["version"], 1)
         self.assertEqual(data["my_review"]["content"], "甲评乙")
         self.assertTrue(data["my_review"]["valid"])
+        # 回执与其余状态字段取自同一快照：公布前该快照中必为待确认
+        self.assertEqual(data["receipt"], {"confirmed": False, "confirmed_at": None})
         # 读取事务已结束、连接已释放
         self.assertIs(reader_conn.in_transaction_at_close, False)
 
@@ -242,6 +261,14 @@ class SnapshotReadTest(unittest.TestCase):
         self.assertEqual(data["manuscript"], "文本一（改）")
         self.assertEqual(data["received"], "丙评甲（新版）")
         self.assertTrue(data["my_review"]["valid"])
+
+        # 公布后明确确认：再次读取时回执与公布状态、意见同快照返回
+        resp = confirm_receipt(self.client, tokens[0])
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        data = self.client.get(f"/api/p/{tokens[0]}").get_json()
+        self.assertTrue(data["published"])
+        self.assertEqual(data["received"], "丙评甲（新版）")
+        self.assertEqual(data["receipt"], resp.get_json()["receipt"])
 
     def test_journal_mode_is_wal(self):
         conn = sqlite3.connect(app_module.DB_PATH)
@@ -563,9 +590,228 @@ class ClarificationTest(unittest.TestCase):
         self.assertEqual(submit_review(self.client, self.t_jia, "x", 1).status_code, 409)
 
 
+class ReceiptTest(unittest.TestCase):
+    """作者确认已读回执：仅显式提交确认、409/404 规则、首次时间不变、隔离、同快照、换发保留、持久化。"""
+
+    PENDING = {"confirmed": False, "confirmed_at": None}
+
+    def setUp(self):
+        self.client = new_client()
+        self.host_token, self.tokens = create_session(self.client)
+        self.t_jia, self.t_yi, self.t_bing = self.tokens
+        publish_with_reviews(self.client, self.host_token, self.tokens)
+
+    def test_explicit_only_and_first_time_kept(self):
+        # 打开页面/轮询多次不自动确认：公布后读到的始终是待确认
+        for _ in range(3):
+            data = state(self.client, self.t_jia)
+            self.assertEqual(data["receipt"], self.PENDING)
+
+        # 首次确认成功，返回已确认与首次确认时间
+        resp = confirm_receipt(self.client, self.t_jia)
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        first = resp.get_json()["receipt"]
+        self.assertTrue(first["confirmed"])
+        self.assertTrue(first["confirmed_at"])
+
+        # 状态快照随即反映已确认与首次时间
+        data = state(self.client, self.t_jia)
+        self.assertEqual(data["receipt"], first)
+
+        # 重复确认仍成功，但首次确认时间不变（库里仍只有一行）
+        resp2 = confirm_receipt(self.client, self.t_jia)
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(resp2.get_json()["receipt"], first)
+        self.assertEqual(receipt_count_for(self.t_jia), 1)
+
+    def test_before_publish_409_and_no_write(self):
+        c2 = new_client()
+        host2, t2 = create_session(c2)
+        # 公布前确认 409（即使已经提交过意见），且不写回执
+        self.assertEqual(confirm_receipt(c2, t2[0]).status_code, 409)
+        for tok in t2:
+            submit_review(c2, tok, "x", 1)
+        self.assertEqual(confirm_receipt(c2, t2[0]).status_code, 409)
+        self.assertEqual(receipt_count_for(t2[0]), 0)
+        # 公布前参与页仍返回待确认，主持台不含回执字段
+        self.assertEqual(state(c2, t2[0])["receipt"], self.PENDING)
+        for r in c2.get(f"/api/h/{host2}").get_json()["reviewers"]:
+            self.assertNotIn("receipt", r)
+        # 补齐公布后该会话可正常确认（409 未污染状态）
+        self.assertEqual(c2.post(f"/api/h/{host2}/publish").status_code, 200)
+        self.assertEqual(confirm_receipt(c2, t2[0]).status_code, 200)
+
+    def test_invalid_and_retired_token_404(self):
+        # 无效个人链接 404
+        self.assertEqual(confirm_receipt(new_client(), "无效链接").status_code, 404)
+
+        # 换发后旧链接确认一律 404，回执只随原身份（新链接）保留
+        resp = self.client.post(
+            f"/api/h/{self.host_token}/rotate-link",
+            json={"name": "甲", "link": f"/p/{self.t_jia}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        new_jia = resp.get_json()["url"].rsplit("/", 1)[-1]
+        # 先用新链接确认
+        self.assertEqual(confirm_receipt(self.client, new_jia).status_code, 200)
+        # 旧链接再确认仍是 404（不是 200/409）
+        old_resp = confirm_receipt(self.client, self.t_jia)
+        self.assertEqual(old_resp.status_code, 404)
+        self.assertNotIn(new_jia, old_resp.get_data(as_text=True))
+        # 新链接看到的是同一回执；用新链接重复确认首次时间不变
+        first = state(self.client, new_jia)["receipt"]
+        self.assertTrue(first["confirmed"])
+        self.assertEqual(
+            confirm_receipt(self.client, new_jia).get_json()["receipt"], first
+        )
+        self.assertEqual(receipt_count_for(new_jia), 1)
+        # 回执挂在同一参与者行上：旧 token 已移入 token_history，其参与者仍只有一行回执
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            history_rows = conn.execute(
+                "SELECT COUNT(*) FROM receipts rc"
+                " JOIN token_history th ON th.participant_id=rc.participant_id"
+                " WHERE th.token=?",
+                (self.t_jia,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(history_rows, 1)
+
+    def test_removed_member_404_and_not_on_host(self):
+        # 移除只能在公布前：另建未公布会话，移除乙后旧链接确认 404
+        c2 = new_client()
+        host2, t2 = create_named_session(c2, ["甲", "乙", "丙", "丁"])
+        for tok, content in zip(
+            [t2["甲"], t2["乙"], t2["丙"], t2["丁"]],
+            ["甲评乙", "乙评丙", "丙评丁", "丁评甲"],
+        ):
+            self.assertEqual(submit_review(c2, tok, content, 1).status_code, 200)
+        self.assertEqual(remove_member(c2, host2, "乙").status_code, 200)
+        self.assertEqual(confirm_receipt(c2, t2["乙"]).status_code, 404)
+
+    def test_isolation_only_own_receipt(self):
+        # 甲确认；乙、丙以及主持台之外的任何参与页都拿不到甲的确认时间
+        resp = confirm_receipt(self.client, self.t_jia)
+        first_at = resp.get_json()["receipt"]["confirmed_at"]
+        self.assertEqual(state(self.client, self.t_yi)["receipt"], self.PENDING)
+        self.assertEqual(state(self.client, self.t_bing)["receipt"], self.PENDING)
+        self.assertNotIn(
+            first_at, self.client.get(f"/api/p/{self.t_yi}").get_data(as_text=True)
+        )
+        self.assertNotIn(
+            first_at, self.client.get(f"/api/p/{self.t_bing}").get_data(as_text=True)
+        )
+        # 乙确认不影响甲：各自只看到自己的首次时间
+        resp_yi = confirm_receipt(self.client, self.t_yi)
+        self.assertEqual(state(self.client, self.t_jia)["receipt"]["confirmed_at"], first_at)
+        self.assertEqual(
+            state(self.client, self.t_yi)["receipt"], resp_yi.get_json()["receipt"]
+        )
+
+    def test_host_shows_receipts_in_original_order_after_publish(self):
+        names = ["戊", "甲", "丁", "乙"]  # 打乱的录入顺序，按 position 排序
+        c2 = new_client()
+        host2, t2 = create_named_session(c2, names)
+        toks = [t2[n] for n in names]
+        # 每人评下一位（末位评首位），稿件均为 v1；内容用唯一占位串便于主持台隔离断言
+        for i, tok in enumerate(toks):
+            submit_review(c2, tok, f"意见正文{i}", 1)
+        self.assertEqual(c2.post(f"/api/h/{host2}/publish").status_code, 200)
+        # 仅"甲"与"乙"确认（乱序确认）
+        confirm_receipt(c2, t2["乙"])
+        confirm_receipt(c2, t2["甲"])
+        reviewers = c2.get(f"/api/h/{host2}").get_json()["reviewers"]
+        # 按留存名单原顺序
+        self.assertEqual([r["name"] for r in reviewers], names)
+        by_name = {r["name"]: r["receipt"] for r in reviewers}
+        self.assertTrue(by_name["甲"]["confirmed"])
+        self.assertTrue(by_name["乙"]["confirmed"])
+        self.assertEqual(by_name["戊"], self.PENDING)
+        self.assertEqual(by_name["丁"], self.PENDING)
+        # 主持台不展示意见或问答内容
+        body = c2.get(f"/api/h/{host2}").get_data(as_text=True)
+        self.assertNotIn("评", body)
+        # 问一条问题后，主持台仍不含问答
+        ask(c2, t2["戊"], "主持台不该看到的问题")
+        body = c2.get(f"/api/h/{host2}").get_data(as_text=True)
+        self.assertNotIn("主持台不该看到的问题", body)
+
+    def test_receipt_in_same_snapshot_as_state_fields(self):
+        resp = confirm_receipt(self.client, self.t_jia)
+        first = resp.get_json()["receipt"]
+        data = state(self.client, self.t_jia)
+        # 回执与公布状态、稿件版本、收到的意见、问答字段在同一响应（同快照）返回
+        self.assertTrue(data["published"])
+        self.assertEqual(data["version"], 1)
+        self.assertEqual(data["received"], "丙评甲")
+        self.assertEqual(data["receipt"], first)
+
+    def test_confirmation_does_not_change_content_or_permissions(self):
+        # 确认前后：稿件、收到的意见不变；仍可一问一答
+        ask(self.client, self.t_jia, "甲先提问")
+        before = state(self.client, self.t_jia)
+        confirm_receipt(self.client, self.t_jia)
+        after = state(self.client, self.t_jia)
+        self.assertEqual(after["manuscript"], before["manuscript"])
+        self.assertEqual(after["version"], before["version"])
+        self.assertEqual(after["received"], before["received"])
+        self.assertEqual(
+            after["received_clarification"]["question"], "甲先提问"
+        )
+        # 丙仍可答复；甲已确认不影响答复权限
+        self.assertEqual(answer(self.client, self.t_bing, "丙答复").status_code, 200)
+        # 确认不解锁冻结：改稿/意见仍 409，一问一答已提交不可再改
+        self.assertEqual(
+            self.client.put(
+                f"/api/p/{self.t_jia}/manuscript", json={"manuscript": "x"}
+            ).status_code,
+            409,
+        )
+        self.assertEqual(submit_review(self.client, self.t_jia, "x", 1).status_code, 409)
+        self.assertEqual(ask(self.client, self.t_jia, "再问").status_code, 409)
+
+    def test_concurrent_first_confirmation_single_timestamp(self):
+        results = []
+
+        def worker():
+            results.append(confirm_receipt(new_client(), self.t_jia).status_code)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+            self.assertFalse(t.is_alive())
+        # 首次与并发重复确认都视为成功
+        self.assertEqual(sorted(results), [200] * 5)
+        # 但只有一行回执，故只有一个首次确认时间
+        self.assertEqual(receipt_count_for(self.t_jia), 1)
+        row = self.client.get(f"/api/p/{self.t_jia}").get_json()["receipt"]
+        self.assertTrue(row["confirmed"])
+        confirm_receipt(self.client, self.t_jia)
+        self.assertEqual(
+            state(self.client, self.t_jia)["receipt"]["confirmed_at"],
+            row["confirmed_at"],
+        )
+
+    def test_persistence_across_restart(self):
+        resp = confirm_receipt(self.client, self.t_jia)
+        first = resp.get_json()["receipt"]["confirmed_at"]
+        # 模拟重启：再次 init_db 幂等
+        app_module.init_db()
+        self.assertEqual(state(self.client, self.t_jia)["receipt"]["confirmed_at"], first)
+        self.assertEqual(state(self.client, self.t_yi)["receipt"], self.PENDING)
+        # 乙重启后仍可首次确认；甲重启后重复确认时间不变
+        self.assertTrue(confirm_receipt(self.client, self.t_yi).get_json()["receipt"]["confirmed"])
+        self.assertEqual(
+            confirm_receipt(self.client, self.t_jia).get_json()["receipt"]["confirmed_at"],
+            first,
+        )
+
+
 class RotateLinkTest(unittest.TestCase):
     """个人链接换发：404/409/400 规则、旧链接全接口失效、数据沿用、并发与提交顺序、持久化。"""
-
     def setUp(self):
         self.client = new_client()
         self.host_token, self.tokens = create_session(self.client)
@@ -1453,12 +1699,17 @@ class OldSchemaMigrationTest(unittest.TestCase):
                 c.close()
             self.assertIn("clarifications", tables)
             self.assertIn("token_history", tables)
+            self.assertIn("receipts", tables)
 
             # 旧数据原样保留，且新表可直接读写
             client = new_client()
             data = client.get("/api/p/tk").get_json()
             self.assertEqual(data["name"], "旧库作者")
             self.assertEqual(data["received"], "旧意见")
+            # 旧库既有意见初始为待确认
+            self.assertEqual(
+                data["receipt"], {"confirmed": False, "confirmed_at": None}
+            )
             self.assertEqual(ask(client, "tk", "旧库追问").status_code, 200)
 
             # 旧库上同样可以换发链接：旧链接作废，新链接沿用稿件与意见、问答
@@ -1474,10 +1725,18 @@ class OldSchemaMigrationTest(unittest.TestCase):
             self.assertEqual(data["received"], "旧意见")
             self.assertEqual(data["received_clarification"]["question"], "旧库追问")
 
-            # 模拟重启：再次 init_db 幂等，问答内容保留，新链接仍有效、旧链接仍失效
+            # 旧库自动支持回执：首次确认成功，重复确认首次时间不变
+            r1 = confirm_receipt(client, new_tk)
+            self.assertEqual(r1.status_code, 200, r1.get_json())
+            first = r1.get_json()["receipt"]["confirmed_at"]
+            r2 = confirm_receipt(client, new_tk)
+            self.assertEqual(r2.get_json()["receipt"]["confirmed_at"], first)
+
+            # 模拟重启：再次 init_db 幂等，问答内容保留，回执保留，新链接仍有效、旧链接仍失效
             app_module.init_db()
             data = client.get(f"/api/p/{new_tk}").get_json()
             self.assertEqual(data["received_clarification"]["question"], "旧库追问")
+            self.assertEqual(data["receipt"]["confirmed_at"], first)
             self.assertEqual(client.get("/api/p/tk").status_code, 404)
         finally:
             app_module.DB_PATH = original

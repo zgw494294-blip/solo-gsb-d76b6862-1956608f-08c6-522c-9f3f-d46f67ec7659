@@ -36,6 +36,11 @@ const els = {
   answerMsg: document.getElementById("answer-msg"),
   answerDone: document.getElementById("answer-done"),
   answerText: document.getElementById("answer-text"),
+  receiptForm: document.getElementById("receipt-form"),
+  confirmReceipt: document.getElementById("confirm-receipt"),
+  receiptMsg: document.getElementById("receipt-msg"),
+  receiptDone: document.getElementById("receipt-done"),
+  receiptTime: document.getElementById("receipt-time"),
 };
 
 let firstLoad = true;
@@ -128,6 +133,7 @@ function render(s) {
     els.submitReview.disabled = true;
     els.receivedSection.hidden = false;
     els.received.textContent = s.received !== null ? s.received : "（无）";
+    renderReceipt(s.receipt);
   } else {
     // 分配改变、未确认重读前禁用提交（意见文本框保留可编辑）；公布前其余状态可提交
     els.submitReview.disabled = gated;
@@ -149,9 +155,21 @@ els.confirmReread.addEventListener("click", () => {
   setMsg(els.reviewMsg, "已绑定新分配，请在阅读新稿件后提交意见。");
 });
 
+// 作者视角：对收到的匿名意见的已读回执：只按服务端快照展示，轮询/打开页面不自动确认
+function renderReceipt(receipt) {
+  const confirmed = !!(receipt && receipt.confirmed);
+  els.receiptForm.hidden = confirmed;
+  els.confirmReceipt.disabled = false;
+  els.receiptDone.hidden = !confirmed;
+  if (confirmed) {
+    els.receiptTime.textContent = receipt.confirmed_at
+      ? "首次确认时间：" + receipt.confirmed_at + "（UTC）"
+      : "";
+  }
+}
+
 // 作者视角：对收到的匿名意见的一问一答
-function renderQuestion(c) {
-  // 尚未提问：仅在状态位允许时保持输入框可编辑；轮询不触碰输入框，避免覆盖正在输入的内容
+function renderQuestion(c) {  // 尚未提问：仅在状态位允许时保持输入框可编辑；轮询不触碰输入框，避免覆盖正在输入的内容
   if (!c) {
     els.questionForm.hidden = false;
     els.questionDone.hidden = true;
@@ -285,6 +303,29 @@ els.submitAnswer.addEventListener("click", async () => {
   );
   refresh(); // 成功后用快照锁定为只读；失败也刷新以发现其他标签页的并发提交
   if (ok) els.answerInput.value = "";
+});
+
+// 作者明确确认已读自己收到的意见：仅点击本按钮才提交；以服务端成功响应更新确认状态
+els.confirmReceipt.addEventListener("click", async () => {
+  els.confirmReceipt.disabled = true;
+  setMsg(els.receiptMsg, "");
+  try {
+    const r = await fetch("/api/p/" + token + "/receipt", { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) {
+      // 409（尚未公布等）保留按钮可再点；404（链接失效/换发）由下次 refresh 呈现致命提示
+      els.confirmReceipt.disabled = false;
+      setMsg(els.receiptMsg, data.error || "确认失败", true);
+      if (r.status === 404) refresh();
+      return;
+    }
+    setMsg(els.receiptMsg, "");
+    // 页面以服务端成功响应更新确认状态（而非本地乐观切换）
+    renderReceipt(data.receipt);
+  } catch {
+    els.confirmReceipt.disabled = false;
+    setMsg(els.receiptMsg, "网络错误，请重试", true);
+  }
 });
 
 refresh();

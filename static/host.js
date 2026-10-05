@@ -42,7 +42,22 @@ function render(s) {
     const tdStatus = document.createElement("td");
     tdStatus.textContent = r.submitted ? "已交" : "待交";
     tdStatus.className = r.submitted ? "ok" : "pending";
-    tr.append(tdName, tdStatus);
+    // 已读回执：公布后按留存名单原顺序显示已确认/待确认与首次确认时间；
+    // 公布前该列留空（"—"）。此处不展示任何意见或问答内容
+    const tdReceipt = document.createElement("td");
+    if (s.published && r.receipt) {
+      if (r.receipt.confirmed) {
+        tdReceipt.textContent = "已确认" + (r.receipt.confirmed_at ? "（" + r.receipt.confirmed_at + "）" : "");
+        tdReceipt.className = "ok";
+      } else {
+        tdReceipt.textContent = "待确认";
+        tdReceipt.className = "pending";
+      }
+    } else {
+      tdReceipt.textContent = "—";
+      tdReceipt.className = "muted";
+    }
+    tr.append(tdName, tdStatus, tdReceipt);
     tbody.appendChild(tr);
   }
 

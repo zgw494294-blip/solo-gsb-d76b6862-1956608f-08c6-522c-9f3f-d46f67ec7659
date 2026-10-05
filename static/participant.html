@@ -67,6 +67,20 @@
       <h2>我收到的匿名意见</h2>
       <pre id="received" class="manuscript-view"></pre>
 
+      <div id="receipt-box" class="clarify">
+        <h3>确认已读</h3>
+        <div id="receipt-form">
+          <p class="muted">请在阅读上面的匿名意见后，点击按钮明确确认已读；仅打开页面、刷新或提问都不会自动确认。确认不影响你提问或对方答复。</p>
+          <div class="row-actions">
+            <button id="confirm-receipt" class="primary" type="button">我已阅读收到的意见</button>
+          </div>
+          <p id="receipt-msg"></p>
+        </div>
+        <div id="receipt-done" class="clarify-item" hidden>
+          <strong>你已确认已读。</strong><span id="receipt-time" class="muted"></span>
+        </div>
+      </div>
+
       <div id="question-box" class="clarify">
         <h3>对该意见提出澄清问题</h3>
         <p class="muted">公布后可就收到的匿名意见提一次澄清问题，对应评审者将答复一次；每条意见仅一问一答，提交后均不可修改。页面不会显示对方姓名或链接。</p>
