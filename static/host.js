@@ -27,11 +27,16 @@ function render(s) {
   document.getElementById("published-banner").hidden = !s.published;
 
   const pending = s.reviewers.filter((r) => !r.submitted).map((r) => r.name);
+  const acked = s.reviewers.filter((r) => r.acknowledged).length;
   document.getElementById("pending-summary").textContent = s.published
-    ? "互评已结束。"
+    ? "互评已结束。已读回执：" + acked + "/" + s.reviewers.length + " 已确认。"
     : pending.length
       ? "待交人员：" + pending.join("、")
       : "全部已交，可以公布。";
+
+  // 已读回执列仅公布后展示（按留存名单原顺序），不含意见或问答内容
+  document.getElementById("ack-head").hidden = !s.published;
+  document.getElementById("ack-note").hidden = !s.published;
 
   const tbody = document.getElementById("reviewers");
   tbody.innerHTML = "";
@@ -43,6 +48,14 @@ function render(s) {
     tdStatus.textContent = r.submitted ? "已交" : "待交";
     tdStatus.className = r.submitted ? "ok" : "pending";
     tr.append(tdName, tdStatus);
+    if (s.published) {
+      const tdAck = document.createElement("td");
+      tdAck.textContent = r.acknowledged
+        ? "已确认（" + r.acknowledged_at + "）"
+        : "待确认";
+      tdAck.className = r.acknowledged ? "ok" : "pending";
+      tr.appendChild(tdAck);
+    }
     tbody.appendChild(tr);
   }
 

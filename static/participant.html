@@ -67,6 +67,18 @@
       <h2>我收到的匿名意见</h2>
       <pre id="received" class="manuscript-view"></pre>
 
+      <div id="ack-box" class="clarify">
+        <h3>确认已读</h3>
+        <p class="muted">阅读后请明确确认收到此意见；仅打开页面、停留或提问不会自动确认。确认后主持台可见你的确认状态与首次确认时间（不含意见内容）。</p>
+        <div id="ack-form">
+          <div class="row-actions">
+            <button id="ack-button" class="primary" type="button">我已阅读，确认收到此意见</button>
+          </div>
+          <p id="ack-msg"></p>
+        </div>
+        <p id="ack-done" class="ok" hidden>已确认收到此意见（首次确认时间：<span id="ack-time"></span>）。</p>
+      </div>
+
       <div id="question-box" class="clarify">
         <h3>对该意见提出澄清问题</h3>
         <p class="muted">公布后可就收到的匿名意见提一次澄清问题，对应评审者将答复一次；每条意见仅一问一答，提交后均不可修改。页面不会显示对方姓名或链接。</p>

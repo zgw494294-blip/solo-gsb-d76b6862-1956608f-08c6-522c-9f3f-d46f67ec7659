@@ -8,6 +8,12 @@
 - 每篇当前稿都有有效意见时才可一次公布；公布后作者可见匿名意见，稿件与意见锁定。
 - 公布后作者可对收到的意见提一次澄清问题，对应评审者答复一次；每条意见一问一答，
   问答只随参与状态快照返回给该作者与评审者，主持台与其他参与者均不可见。
+- 公布后作者可凭个人链接明确确认已读自己收到的意见（已读回执）：服务端确定作者及
+  对应意见，首次成功记录确认时间，重复确认仍成功且不改首次时间；打开页面、轮询或
+  提问都不自动确认。作者状态返回自己的回执（与其他字段同一快照），主持台在公布后
+  按留存名单原顺序显示各成员已确认/待确认与首次确认时间（不含意见或问答内容），
+  其他参与者不得获得别人的回执。确认不改变稿件、意见及问答，也不影响提问或答复
+  权限；换发链接后回执随原身份保留。
 - 个人链接泄露时，主持人可凭主持链接在主持台为指定成员换发链接（公布前后均可）：
   生成新随机链接更新主持台，旧链接立即作废——其之后发起的状态读取与一切写入均 404；
   新链接沿用同一参与者的稿件、版本、分配、意见与问答，不重建身份、不使意见失效。
@@ -81,6 +87,13 @@ CREATE TABLE IF NOT EXISTS clarifications (
     asked_at TEXT NOT NULL DEFAULT (datetime('now')),
     answered_at TEXT
 );
+-- 公布后的已读回执：作者确认已读自己收到的那条意见；每条意见至多一条回执，
+-- 首次确认时间写入后不再改变（重复确认不覆盖）
+CREATE TABLE IF NOT EXISTS receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id INTEGER NOT NULL UNIQUE REFERENCES reviews(id),
+    acknowledged_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 -- 换发链接时登记的历史（已作废）个人链接：仅用于换发时区分"所见链接已过期"(409)，
 -- 作废链接在参与端的一切读取与写入均按不存在处理（404）
 CREATE TABLE IF NOT EXISTS token_history (
@@ -96,11 +109,11 @@ app = Flask(__name__)
 def init_db():
     """建库建表（幂等），数据落盘在 DB_PATH，重启后保留。
 
-    旧版数据库（无 clarifications / token_history 表，或 participants 缺
-    active / assignment_nonce / assignment_gen 列）启动时自动补建问答表、
-    历史链接表与移除成员所需列，既有 sessions/participants/reviews 数据原样保留；
+    旧版数据库（无 clarifications / token_history / receipts 表，或 participants 缺
+    active / assignment_nonce / assignment_gen 列）启动时自动补建问答表、历史链接表、
+    回执表与移除成员所需列，既有 sessions/participants/reviews 数据原样保留；
     补列时为每位既有成员回填一个分配凭据（视为其当前分配从未变过，gen=0），
-    旧库因此自动支持移除成员，无需手动迁移。
+    旧库因此自动支持移除成员与已读回执（既有意见初始为待确认），无需手动迁移。
     """
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -284,6 +297,31 @@ def clarification_view(row):
     }
 
 
+def find_received_review(conn, me):
+    """作者当前收到的那条有效意见（针对其当前稿件版本，评审者须仍留存）。
+
+    公布后稿件与意见冻结，这条意见随之固定；一问一答与已读回执都绑定在它上面。
+    """
+    return conn.execute(
+        "SELECT r.* FROM reviews r JOIN participants v ON r.reviewer_id=v.id"
+        " WHERE r.target_id=? AND r.valid=1 AND r.target_version=? AND v.active=1",
+        (me["id"], me["version"]),
+    ).fetchone()
+
+
+def find_receipt(conn, review_id):
+    return conn.execute(
+        "SELECT * FROM receipts WHERE review_id=?", (review_id,)
+    ).fetchone()
+
+
+def receipt_view(row):
+    """回执对外结构：是否已确认与首次确认时间；不含任何身份信息与私密链接。"""
+    if row is None:
+        return {"acknowledged": False, "acknowledged_at": None}
+    return {"acknowledged": True, "acknowledged_at": row["acknowledged_at"]}
+
+
 # ---------------- 页面 ----------------
 
 @app.get("/")
@@ -374,7 +412,22 @@ def host_status(host_token):
             submitted = review_is_current(review, target)
             if not submitted:
                 can_publish = False
-            reviewers.append({"name": p["name"], "submitted": submitted})
+            # 已读回执：按留存名单原顺序随 reviewers 返回；仅公布后有意义（公布前一律
+            # 待确认，前端不展示）。只含确认状态与首次确认时间，不含意见或问答内容
+            receipt = None
+            if session["published"]:
+                received = find_received_review(conn, p)
+                if received is not None:
+                    receipt = find_receipt(conn, received["id"])
+            view = receipt_view(receipt)
+            reviewers.append(
+                {
+                    "name": p["name"],
+                    "submitted": submitted,
+                    "acknowledged": view["acknowledged"],
+                    "acknowledged_at": view["acknowledged_at"],
+                }
+            )
         conn.commit()
         return jsonify(
             {
@@ -613,6 +666,8 @@ def participant_state(token):
             },
             "my_review": None,
             "received": None,
+            # 已读回执：公布前一律 None；公布后为作者自己的回执（不含他人回执）
+            "receipt": None,
             # 一问一答：公布前一律 None；公布后只返回与本人相关的那条意见的问答
             "received_clarification": None,
             "my_review_clarification": None,
@@ -632,13 +687,11 @@ def participant_state(token):
                 )
         if published:
             # 匿名：只返回意见内容，不返回评审人任何信息；评审者须仍留存
-            row = conn.execute(
-                "SELECT r.* FROM reviews r JOIN participants v ON r.reviewer_id=v.id"
-                " WHERE r.target_id=? AND r.valid=1 AND r.target_version=? AND v.active=1",
-                (me["id"], me["version"]),
-            ).fetchone()
+            row = find_received_review(conn, me)
             if row is not None:
                 resp["received"] = row["content"]
+                # 作者自己的已读回执，与稿件、意见、问答同一快照读取
+                resp["receipt"] = receipt_view(find_receipt(conn, row["id"]))
                 # 作者视角：就我收到的这条意见的一问一答（仅本人与对应评审者可见）
                 resp["received_clarification"] = clarification_view(
                     find_clarification(conn, row["id"])
@@ -781,11 +834,7 @@ def ask_clarification(token):
             conn.rollback()
             return err("尚未公布，不能提问", 409)
         # 服务端按个人链接确定身份与对应意见：只能问自己收到的那条有效意见
-        review = conn.execute(
-            "SELECT r.* FROM reviews r JOIN participants v ON r.reviewer_id=v.id"
-            " WHERE r.target_id=? AND r.valid=1 AND r.target_version=? AND v.active=1",
-            (me["id"], me["version"]),
-        ).fetchone()
+        review = find_received_review(conn, me)
         if review is None:
             conn.rollback()
             return err("没有可追问的意见", 409)
@@ -848,6 +897,51 @@ def answer_clarification(token):
         )
         conn.commit()
         return jsonify({"ok": True})
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ---------------- 公布后的已读回执 ----------------
+
+
+@app.post("/api/p/<token>/ack")
+def acknowledge_receipt(token):
+    """作者明确确认已读自己收到的匿名意见：公布后开放，无需请求体。
+
+    服务端凭个人链接确定作者及对应意见；首次成功记录确认时间，重复确认仍成功
+    且不改首次时间。打开页面、轮询或提问都不会自动确认，只能显式调用本接口。
+    公布前一律 409；无效、已退出或已换发的旧个人链接一律 404；失败不写任何数据。
+    确认只写入回执本身：稿件、意见与一问一答均不变，提问/答复权限不受影响；
+    换发链接后回执随原身份（同一参与者行）保留。
+    """
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        me = find_participant(conn, token)
+        if me is None:
+            conn.rollback()
+            return err("个人链接无效", 404)
+        session = conn.execute(
+            "SELECT published FROM sessions WHERE id=?", (me["session_id"],)
+        ).fetchone()
+        # 公布前确认一律 409，且不改变任何数据
+        if not session["published"]:
+            conn.rollback()
+            return err("尚未公布，不能确认已读", 409)
+        # 服务端按个人链接确定身份与对应意见：只能确认自己收到的那条有效意见
+        review = find_received_review(conn, me)
+        if review is None:
+            conn.rollback()
+            return err("没有可确认的意见", 409)
+        receipt = find_receipt(conn, review["id"])
+        if receipt is None:
+            # 首次确认：记录确认时间；写事务串行化 + review_id UNIQUE 下并发确认只写一次
+            conn.execute("INSERT INTO receipts (review_id) VALUES (?)", (review["id"],))
+            receipt = find_receipt(conn, review["id"])
+        # 重复确认仍成功：不回写，首次确认时间保持不变
+        conn.commit()
+        return jsonify({"ok": True, "acknowledged_at": receipt["acknowledged_at"]})
     except Exception:
         conn.rollback()
         raise

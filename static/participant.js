@@ -20,6 +20,12 @@ const els = {
   publishedBanner: document.getElementById("published-banner"),
   receivedSection: document.getElementById("received-section"),
   received: document.getElementById("received"),
+  ackBox: document.getElementById("ack-box"),
+  ackForm: document.getElementById("ack-form"),
+  ackButton: document.getElementById("ack-button"),
+  ackMsg: document.getElementById("ack-msg"),
+  ackDone: document.getElementById("ack-done"),
+  ackTime: document.getElementById("ack-time"),
   questionBox: document.getElementById("question-box"),
   questionForm: document.getElementById("question-form"),
   questionInput: document.getElementById("question-input"),
@@ -133,10 +139,28 @@ function render(s) {
     els.submitReview.disabled = gated;
   }
 
+  renderReceipt(s.published ? s.receipt : null);
   renderQuestion(s.published ? s.received_clarification : null);
   renderAnswer(s.published ? s.my_review_clarification : null);
 
   firstLoad = false;
+}
+
+// 作者视角：已读回执。确认状态以服务端快照/成功响应为准；打开页面与轮询不会自动确认
+function renderReceipt(r) {
+  if (!r) {
+    els.ackBox.hidden = true;
+    return;
+  }
+  els.ackBox.hidden = false;
+  if (r.acknowledged) {
+    els.ackForm.hidden = true;
+    els.ackDone.hidden = false;
+    els.ackTime.textContent = r.acknowledged_at;
+  } else {
+    els.ackForm.hidden = false;
+    els.ackDone.hidden = true;
+  }
 }
 
 // 参与者确认已重新阅读新分配的稿件：绑定新凭据并启用提交（不清空已输入的意见文本）
@@ -285,6 +309,28 @@ els.submitAnswer.addEventListener("click", async () => {
   );
   refresh(); // 成功后用快照锁定为只读；失败也刷新以发现其他标签页的并发提交
   if (ok) els.answerInput.value = "";
+});
+
+// 作者明确确认已读收到的意见：只有点击才确认，以服务端成功响应更新确认状态
+els.ackButton.addEventListener("click", async () => {
+  els.ackButton.disabled = true;
+  setMsg(els.ackMsg, "");
+  try {
+    const r = await fetch("/api/p/" + token + "/ack", { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) {
+      setMsg(els.ackMsg, data.error || "确认失败，请重试", true);
+    } else {
+      // 服务端已记录首次确认时间：立即按成功响应更新，再由快照复核
+      els.ackForm.hidden = true;
+      els.ackDone.hidden = false;
+      els.ackTime.textContent = data.acknowledged_at;
+    }
+  } catch {
+    setMsg(els.ackMsg, "网络错误，请重试", true);
+  }
+  els.ackButton.disabled = false;
+  refresh();
 });
 
 refresh();

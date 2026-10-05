@@ -18,9 +18,10 @@
       <h2>互评进度</h2>
       <p id="pending-summary" class="muted"></p>
       <table>
-        <thead><tr><th>姓名</th><th>互评意见状态</th></tr></thead>
+        <thead><tr><th>姓名</th><th>互评意见状态</th><th id="ack-head" hidden>已读回执</th></tr></thead>
         <tbody id="reviewers"></tbody>
       </table>
+      <p class="muted" id="ack-note" hidden>已读回执按留存名单原顺序显示：作者在其页面明确确认已读后记为"已确认"并给出首次确认时间；此处不展示意见或问答内容。</p>
       <div class="row-actions">
         <button id="publish" class="primary" disabled>全部公布</button>
       </div>
